@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use windows::Win32::Foundation::{HMODULE, RPC_E_CHANGED_MODE};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_VIDEO_DECODER_DESC, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Query, ID3D11Texture2D, ID3D11VideoDevice,
+    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_QUERY_DESC, D3D11_QUERY_EVENT,
+    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11_VIDEO_DECODER_DESC, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+    ID3D11Multithread, ID3D11Query, ID3D11Texture2D, ID3D11VideoDevice,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_P010};
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
@@ -168,6 +169,27 @@ impl Gpu {
         self.manager.as_raw() as usize
     }
 
+    /// GPU to GPU copy of the rectangle `crop` (x, y, width, height; even coordinates) of slice
+    /// `src_index` of `src` into `dst` (the top left corner of a texture of that size): the decoder
+    /// output into a surface the renderer can open. Nothing crosses to the CPU.
+    pub fn copy_picture(&self, dst: &ID3D11Texture2D, src: &ID3D11Texture2D, src_index: u32, crop: (u32, u32, u32, u32)) -> Result<(), String> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: a plain COM call writing a descriptor struct.
+        unsafe { src.GetDesc(&mut desc) };
+        if crop.0.saturating_add(crop.2) > desc.Width || crop.1.saturating_add(crop.3) > desc.Height || src_index >= desc.ArraySize.max(1) {
+            return Err(format!(
+                "the decoder's {}x{} surface does not hold the {}x{} picture at {},{}",
+                desc.Width, desc.Height, crop.2, crop.3, crop.0, crop.1
+            ));
+        }
+        let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        let region = D3D11_BOX { left: crop.0, top: crop.1, front: 0, right: crop.0.saturating_add(crop.2), bottom: crop.1.saturating_add(crop.3), back: 1 };
+        // SAFETY: both textures belong to this device; the context is used under the gate and the
+        // box lies inside the source (the decoder output is at least the coded size).
+        unsafe { self.context.CopySubresourceRegion(dst, 0, 0, 0, 0, src, src_index, Some(&region)) };
+        Ok(())
+    }
+
     /// Block until every command given to the Direct3D 11 device so far has finished on the GPU
     /// (an event query): what hands a surface written by Direct3D 11 over to another device. It
     /// waits for the GPU only; no pixel is copied.
@@ -232,6 +254,21 @@ fn adapter_identity(device: &ID3D11Device) -> (Option<String>, Option<(u32, i32)
     (desc.Description.get(..len).map(String::from_utf16_lossy), Some((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart)))
 }
 
+/// The Direct3D 11 texture (and array slice) a decoder output sample is backed by. Errors when the
+/// sample is in system memory, which means the decoder did not use the GPU.
+pub fn sample_texture(sample: &IMFSample) -> Result<(ID3D11Texture2D, u32), String> {
+    // SAFETY: plain COM calls on live interfaces; `GetResource` writes one interface pointer
+    // (a new reference) into `tex`, which `Option<ID3D11Texture2D>` owns and releases.
+    unsafe {
+        let buffer = sample.GetBufferByIndex(0).map_err(|e| format!("decoder output has no buffer: {e}"))?;
+        let dxgi: IMFDXGIBuffer = buffer.cast().map_err(|_| "decoder output is in system memory: the decoder is not using the GPU".to_string())?;
+        let mut tex: Option<ID3D11Texture2D> = None;
+        dxgi.GetResource(&ID3D11Texture2D::IID, &mut tex as *mut Option<ID3D11Texture2D> as *mut *mut c_void)
+            .map_err(|e| format!("decoder output is not a 2D texture: {e}"))?;
+        Ok((tex.ok_or("decoder output has no texture")?, dxgi.GetSubresourceIndex().map_err(|e| format!("no subresource index: {e}"))?))
+    }
+}
+
 /// Reads decoded surfaces back into system memory through a staging texture it keeps between
 /// pictures (recreated when the surface format or size changes). This is the GPU to CPU copy of
 /// the backend: a zero-copy path would share the surface with the renderer instead.
@@ -257,16 +294,20 @@ impl Readback {
     }
 
     fn read_inner<R>(&mut self, gpu: &Gpu, sample: &IMFSample, format: SurfaceFormat, f: impl FnOnce(&Biplanar) -> Result<R, String>) -> Result<R, String> {
-        // SAFETY: plain COM calls on live interfaces; `GetResource` writes one interface pointer
-        // (a new reference) into `tex`, which `Option<ID3D11Texture2D>` owns and releases.
-        let (tex, index) = unsafe {
-            let buffer = sample.GetBufferByIndex(0).map_err(|e| format!("decoder output has no buffer: {e}"))?;
-            let dxgi: IMFDXGIBuffer = buffer.cast().map_err(|_| "decoder output is in system memory: the decoder is not using the GPU".to_string())?;
-            let mut tex: Option<ID3D11Texture2D> = None;
-            dxgi.GetResource(&ID3D11Texture2D::IID, &mut tex as *mut Option<ID3D11Texture2D> as *mut *mut c_void)
-                .map_err(|e| format!("decoder output is not a 2D texture: {e}"))?;
-            (tex.ok_or("decoder output has no texture")?, dxgi.GetSubresourceIndex().map_err(|e| format!("no subresource index: {e}"))?)
-        };
+        let (tex, index) = sample_texture(sample)?;
+        self.read_texture(gpu, &tex, index, format, f)
+    }
+
+    /// As [`Readback::read`] for a texture (and array slice) already in hand: the staging copy,
+    /// the mapping, and `f` over the mapped planes.
+    pub fn read_texture<R>(
+        &mut self,
+        gpu: &Gpu,
+        tex: &ID3D11Texture2D,
+        index: u32,
+        format: SurfaceFormat,
+        f: impl FnOnce(&Biplanar) -> Result<R, String>,
+    ) -> Result<R, String> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: a plain COM call writing a descriptor struct.
         unsafe { tex.GetDesc(&mut desc) };
@@ -284,7 +325,7 @@ impl Readback {
         // row for `Height` luma rows followed by `Height / 2` chroma rows (the NV12 / P010 staging
         // layout), valid until `Unmap`, which runs before this block ends.
         unsafe {
-            gpu.context.CopySubresourceRegion(staging, 0, 0, 0, 0, &tex, index, None);
+            gpu.context.CopySubresourceRegion(staging, 0, 0, 0, 0, tex, index, None);
             gpu.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(|e| format!("cannot map the decoded surface: {e}"))?;
         }
         let result = (|| {

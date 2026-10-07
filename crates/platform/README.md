@@ -50,6 +50,16 @@ let availability = filmcraft_platform::register(); // Available("VideoToolbox") 
   - After a `flush` (which drains the MFT) the MFT only restarts at an IDR picture; the GOP cache
     always seeks after a flush, and a caller that continues from the middle of a GOP gets an error
     that `HybridDecoder` answers by replaying the run in software.
+- **Windows zero-copy** (`media_foundation::{interop,surface}`, [ADR 0002](../../docs/adr/0002-zero-copy-decode-interop.md)):
+  when the renderer's wgpu device is a DX12 device on the decoder's adapter
+  (`media_foundation::enable_zero_copy(&device)`), decoded pictures are not read back: each is
+  copied GPU to GPU into a shareable NV12 / P010 Direct3D 11 texture and handed out as
+  `PixelData::Gpu` (`MfSurface`, a `filmcraft_frame::GpuSurface`). `filmcraft_gpu` opens it through
+  the importer this registers: `OpenSharedHandle` as a Direct3D 12 resource, its two planes wrapped as
+  wgpu textures (`wgpu::hal::dx12`), sampled by the compositor's interleaved-chroma kind. CPU
+  consumers call `VideoFrame::cpu()` (a download, once per picture, bit-exact with the software
+  decoder). Off unless the renderer qualifies; `perf.stats` `decode.hardware.zeroCopyFrames` counts the
+  pictures.
 - **Other systems:** `register()` does nothing and returns `Availability::Unavailable`.
 - **`HybridDecoder`** (`hybrid.rs`, safe code): the hardware decoder plus the means to build our
   software decoder for the same `SampleEntry` (`filmcraft_codecs::software_video_decoder`). On a
@@ -96,5 +106,6 @@ playback with no dropped frames at Full, 1/2 and 1/4. Details in
 
 ## Not yet
 
-Zero-copy upload of `CVPixelBuffer`s into wgpu textures; hardware encoding; Media Foundation /
-D3D11 (Windows) and VA-API (Linux) decoders; field-coded H.264.
+Zero-copy upload of `CVPixelBuffer`s into wgpu textures (macOS); a pool of shareable surfaces;
+zero-copy on the Vulkan backend; hardware encoding; VA-API (Linux) decoders; field-coded H.264;
+VP9 / AV1 on Windows.

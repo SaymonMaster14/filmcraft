@@ -49,7 +49,7 @@ In priority order. Agents should prefer this work over adding more checklist ite
 
 1. **Hardware acceleration** (#30), the most visible gap to users:
    - hardware decode on Linux (VA-API); VP9 / AV1 on Windows;
-   - zero-copy decoded frames into wgpu;
+   - zero-copy decoded frames into wgpu (Windows DX12 done, ADR 0002; macOS IOSurface / Metal and Vulkan next);
    - the remaining effects on the GPU: Lumetri, keys, Vignette, Video Limiter, masks (31 common effects are done);
    - GPU export, then hardware encode (H.264 / HEVC).
 2. **A measured parity number.** Add `cargo xtask parity`, run in CI. It should cover menus,

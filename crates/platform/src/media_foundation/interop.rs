@@ -8,6 +8,7 @@
 //! block has a `// SAFETY:` comment; the public items are safe and return `Result<_, String>`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
@@ -35,8 +36,16 @@ unsafe impl Send for SharedSurface {}
 // SAFETY: see above; the surface has no interior mutability.
 unsafe impl Sync for SharedSurface {}
 
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Shareable surfaces alive right now (leak checks in tests, diagnostics).
+pub fn live_surfaces() -> usize {
+    LIVE.load(Ordering::Relaxed)
+}
+
 impl Drop for SharedSurface {
     fn drop(&mut self) {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
         // SAFETY: the handle was created by `CreateSharedHandle` for this surface and is closed
         // exactly once, here. Direct3D 12 resources opened from it keep their own reference.
         let _ = unsafe { CloseHandle(self.handle) };
@@ -46,7 +55,7 @@ impl Drop for SharedSurface {
 impl SharedSurface {
     /// A shareable texture of `size` luma samples (even sizes only: 4:2:0).
     pub fn create(gpu: &Gpu, format: SurfaceFormat, size: (u32, u32)) -> Result<Self, String> {
-        if size.0 == 0 || size.1 == 0 || size.0 % 2 != 0 || size.1 % 2 != 0 || size.0 > 16384 || size.1 > 16384 {
+        if size.0 == 0 || size.1 == 0 || !size.0.is_multiple_of(2) || !size.1.is_multiple_of(2) || size.0 > 16384 || size.1 > 16384 {
             return Err(format!("cannot share a {}x{} 4:2:0 picture", size.0, size.1));
         }
         let desc = D3D11_TEXTURE2D_DESC {
@@ -67,7 +76,9 @@ impl SharedSurface {
         let texture = texture.ok_or("no shareable surface")?;
         let dxgi: IDXGIResource1 = texture.cast().map_err(|e| format!("surface is not shareable: {e}"))?;
         // SAFETY: plain COM call with no security attributes and no name: an anonymous handle.
-        let handle = unsafe { dxgi.CreateSharedHandle(None, DXGI_SHARED_RESOURCE_READ.0 as u32 | DXGI_SHARED_RESOURCE_WRITE.0 as u32, PCWSTR::null()) }.map_err(|e| format!("cannot share the surface: {e}"))?;
+        let handle = unsafe { dxgi.CreateSharedHandle(None, DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0, PCWSTR::null()) }
+            .map_err(|e| format!("cannot share the surface: {e}"))?;
+        LIVE.fetch_add(1, Ordering::Relaxed);
         Ok(Self { texture, handle, format, size })
     }
 
@@ -149,8 +160,12 @@ mod tests {
 
     /// A wgpu DX12 device (None when this machine has none).
     fn dx12() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::DX12, ..wgpu::InstanceDescriptor::new_without_display_handle() });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).ok()?;
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::DX12, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+        let adapter = pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }),
+        )
+        .ok()?;
         let features = adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() })).ok()
     }

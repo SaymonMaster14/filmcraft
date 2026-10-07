@@ -258,7 +258,9 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   everything else, and any stream the GPU's DXVA decoder does not list, is declined. A decoder that
   would hand back system-memory pictures (Microsoft's decoder MFTs do that when DXVA is not
   available) fails the stream, so the hybrid continues with our decoder and Windows' software
-  decoding is never used in its place. Zero-copy (the texture straight to wgpu) is not done yet.
+  decoding is never used in its place. With a DX12 renderer on the decoder's adapter the picture is not
+  read back at all: it stays in GPU memory as a `PixelData::Gpu` (`frame::GpuSurface`), the compositor
+  opens it as wgpu textures, and CPU code reads it through `VideoFrame::cpu()` (ADR 0002).
   Decoders run slices on rayon, so an export worker waiting inside a decode can pick up another
   frame of the same source. A request that finds the shared decoder busy decodes with a private
   decoder.
