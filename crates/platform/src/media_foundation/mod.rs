@@ -29,16 +29,24 @@
 #[allow(unsafe_code)]
 mod gpu;
 #[allow(unsafe_code)]
+mod interop;
+#[allow(unsafe_code)]
 mod mft;
 mod stream;
+mod surface;
+
+pub use interop::live_surfaces;
+pub use surface::{MfSurface, disable as disable_zero_copy, enable as enable_zero_copy, enabled as zero_copy_enabled};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use filmcraft_codecs::hw::{NalCodec, StreamInfo};
 use filmcraft_codecs::{CodecError, DecodedFrame, Result, VideoDecoder};
+use filmcraft_frame::{Chroma, GpuPixels, PixelData, VideoFrame};
 
-use self::gpu::{Gpu, Readback, SurfaceFormat};
+use self::gpu::{Gpu, Readback, SurfaceFormat, sample_texture};
+use self::interop::SharedSurface;
 use self::mft::{MfApi, Mft, Poll};
 use self::stream::Stream;
 use crate::biplanar::{self, Geometry};
@@ -131,6 +139,8 @@ pub struct MfDecoder {
     /// The size the MFT declares for its pictures was checked against the stream's (VP9 / AV1: the
     /// picture size is in the bitstream, and a decoder that disagrees would show padding or crop).
     size_checked: bool,
+    /// The picture rectangle is even in every coordinate, as sharing a 4:2:0 surface needs.
+    can_share: bool,
     /// [`VideoDecoder::flush`] drained the MFT, which then behaves as at the end of a stream: it
     /// only restarts at an IDR picture, the references of the run are gone.
     drained: bool,
@@ -154,6 +164,7 @@ impl MfDecoder {
         let mft = Mft::new(api, &gpu, &stream.spec(format))?;
         log::info!("hardware decoding: {} on {}", mft.name(), gpu.name());
         let geometry = stream.first_geometry(format);
+        let can_share = stream.picture_is_even(&geometry);
         Ok(Self {
             name: stream.name(),
             info: stream.info(),
@@ -169,6 +180,7 @@ impl MfDecoder {
             skip_rasl: false,
             first: true,
             size_checked: false,
+            can_share,
             drained: false,
             fail_after: None,
             fed: 0,
@@ -214,13 +226,56 @@ impl MfDecoder {
         }
     }
 
+    /// The picture of `sample` as a GPU surface the compositor can open: a GPU to GPU copy of the
+    /// cropped rectangle into a shareable texture (no CPU readback).
+    fn share(&self, sample: &windows::Win32::Media::MediaFoundation::IMFSample) -> std::result::Result<VideoFrame, String> {
+        let (cx, cy, w, h) = self.geometry.crop;
+        let (tex, index) = sample_texture(sample)?;
+        let shared = Arc::new(SharedSurface::create(&self.gpu, self.format, (w, h))?);
+        self.gpu.copy_picture(shared.texture(), &tex, index, (cx, cy, w, h))?;
+        let surface = Arc::new(MfSurface::new(self.gpu.clone(), shared, self.geometry));
+        let data = PixelData::Gpu(GpuPixels::new(surface, Chroma::C420, self.format.bits()));
+        Ok(VideoFrame { width: w, height: h, data, color: self.geometry.color, par: self.geometry.par, pts: filmcraft_time::Tick::ZERO })
+    }
+
     /// Take every picture the decoder has ready (presentation order).
     fn collect(&mut self, out: &mut Vec<DecodedFrame>) -> std::result::Result<(), String> {
+        let first_new = out.len();
+        let r = self.collect_inner(out);
+        // shared pictures were copied on the GPU's queue: wait for the copies before anyone else
+        // (another device) reads them
+        if out.get(first_new..).is_some_and(|f| f.iter().any(|d| matches!(d.frame.data, PixelData::Gpu(_)))) {
+            self.gpu.wait_for_gpu()?;
+        }
+        r
+    }
+
+    fn collect_inner(&mut self, out: &mut Vec<DecodedFrame>) -> std::result::Result<(), String> {
         for _ in 0..MAX_OUTPUTS_PER_CALL {
             let Some(mft) = self.mft.as_ref() else { return Ok(()) };
             match mft.poll()? {
                 Poll::NeedInput => return Ok(()),
                 Poll::FormatChanged => self.size_checked = false,
+                Poll::Frame(sample, t) if self.can_share && zero_copy_enabled() => {
+                    if !self.size_checked {
+                        self.check_size()?;
+                    }
+                    match self.share(&sample) {
+                        Ok(frame) => {
+                            filmcraft_codecs::hw::note_hw_zero_copy(1);
+                            let pts = self.take_pts(t);
+                            out.push(DecodedFrame { pts, frame, draft: false });
+                        }
+                        Err(e) => {
+                            // (device lost, out of memory...) the stream goes on through the readback
+                            log::warn!("{}: zero-copy failed ({e}); reading pictures back instead", self.name);
+                            self.can_share = false;
+                            let pts = self.take_pts(t);
+                            let frame = self.readback.read(&self.gpu, &sample, self.format, |b| biplanar::to_frame(b, &self.geometry))?;
+                            out.push(DecodedFrame { pts, frame, draft: false });
+                        }
+                    }
+                }
                 Poll::Frame(sample, t) => {
                     if !self.size_checked {
                         self.check_size()?;
@@ -301,6 +356,7 @@ impl VideoDecoder for MfDecoder {
         // a VP9 key frame says the picture's size and colour (they are not in the container)
         if let Some(g) = self.stream.declared_picture(sample) {
             self.geometry = g;
+            self.can_share = self.stream.picture_is_even(&g);
         }
         let annex_b = self.stream.input(sample, self.need_headers).map_err(CodecError::Decode)?;
         if self.mft.is_none() {

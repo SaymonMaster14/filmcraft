@@ -76,6 +76,9 @@ NVIDIA GPU with NVENC. The FFI layout tests in `crates/platform/src/nvenc/abi_te
 from a C program built with MSVC against NVIDIA's MIT-licensed `nvEncodeAPI.h` (12.1); to regenerate
 them, print the sizes, alignments, offsets, constants and GUIDs of `src/nvenc/ffi.rs` from that
 program and update the asserts.
+  without a Direct3D 11 video device or the HEVC Video Extensions.
+  `tests/zero_copy.rs` also needs a DX12 device compiling with DXC: set `FILMCRAFT_DXC_DIR` to a folder with
+  `dxcompiler.dll` and `dxil.dll` (the Windows SDK has them), otherwise it skips.
 
 ### Pass criteria per codec
 

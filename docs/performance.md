@@ -218,6 +218,24 @@ of 8 s of a 1080p23.976 H.264 clip (191 frames) to H.264 with the default preset
   matched, so these rows are not a quality comparison.
 
 Quality at equal bitrate: see the PR description.
+## Results (HW3: Windows zero-copy decoding, readback → zero-copy)
+
+Same binary and machine as HW2 (Xeon E5-2680 v4, RTX 5060, idle), 2026-10-07, `playback` section, two
+rounds. Three modes: **Off** (software), **readback** (HW2: decode on the GPU, copy each picture to
+the CPU, upload it again; the default Vulkan renderer) and **zero-copy** (HW3: DX12 renderer with DXC,
+the compositor samples the decoder's memory). Reproduce with
+`FILMCRAFT_DXC_DIR="C:\Program Files (x86)\Windows Kitsin.0.26100.0d" cargo xtask bench --sections playback --only "h264-2160 full" --hw auto`
+(without `FILMCRAFT_DXC_DIR` the bench uses the default renderer and CPU pictures).
+
+| case | shown/dropped Off / readback / **zero-copy** | CPU ms/frame Off / readback / **zero-copy** | decode ms per job readback → **zero-copy** |
+|---|---|---|---|
+| H.264 1080p Full | 192/0 / 192/0 / **192/0** | 89-91 / 7.8-8.5 / **2.9-3.3** | 17.5-19.0 → **7.1-7.2** |
+| H.264 2160p Full | 192/0 / 189-190/2-3 / **192/0** | 344-350 / 22.4-23.3 / **6.5-7.2** | 30.4-31.0 → **12.2-12.5** |
+| HEVC 2160p Full | 151-165/27-41 / 190/2 / **192/0** | 360-367 / 17.5-17.7 / **5.2-5.4** | 27.7-28.9 → **7.8** |
+
+Every zero-copy row decoded all its pictures as GPU surfaces (`zeroCopyFrames` = `frames`, 206-208 of
+206-208). What is left per frame is the compositor's draw and the GPU to GPU copy into the shareable
+texture. The readback-path drops of HW2 (2-3 of 192) are gone.
 
 ## Results (GPU1: blend modes on the GPU compositor, #30, before → after)
 
