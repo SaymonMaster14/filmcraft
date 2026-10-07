@@ -2109,6 +2109,8 @@ dependencies = [
  "objc2-core-media",
  "objc2-core-video",
  "objc2-video-toolbox",
+ "pollster 0.4.0",
+ "wgpu",
  "windows 0.62.2",
 ]
 

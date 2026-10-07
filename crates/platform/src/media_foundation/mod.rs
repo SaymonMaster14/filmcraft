@@ -29,6 +29,8 @@
 #[allow(unsafe_code)]
 mod gpu;
 #[allow(unsafe_code)]
+mod interop;
+#[allow(unsafe_code)]
 mod mft;
 
 use std::sync::Arc;

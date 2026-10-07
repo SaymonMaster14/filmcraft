@@ -14,13 +14,13 @@ use windows::Win32::Foundation::{HMODULE, RPC_E_CHANGED_MODE};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING, D3D11_VIDEO_DECODER_DESC, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D, ID3D11VideoDevice,
+    D3D11_USAGE_STAGING, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_VIDEO_DECODER_DESC, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Query, ID3D11Texture2D, ID3D11VideoDevice,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_P010};
 use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
 use windows::Win32::Media::MediaFoundation::{IMFDXGIBuffer, IMFDXGIDeviceManager, IMFSample};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::core::{GUID, Interface};
+use windows::core::{BOOL, GUID, Interface};
 
 use super::mft::MfApi;
 use crate::biplanar::Biplanar;
@@ -75,6 +75,9 @@ pub struct Gpu {
     video: ID3D11VideoDevice,
     manager: IMFDXGIDeviceManager,
     name: String,
+    /// The adapter's LUID (low part, high part): what a Direct3D 12 device must match to share
+    /// memory with this one.
+    luid: Option<(u32, i32)>,
     /// Set when the device was removed or reset: new decoders get a new device.
     lost: AtomicBool,
     /// Serialises our use of the immediate context (the device is also multithread protected,
@@ -131,13 +134,27 @@ impl Gpu {
         let _ = unsafe { mt.SetMultithreadProtected(true) };
         let video: ID3D11VideoDevice = device.cast().map_err(|e| format!("the device has no video decoding: {e}"))?;
         let manager = api.create_device_manager(&device)?;
-        let name = adapter_name(&device).unwrap_or_else(|| "an unknown adapter".into());
-        Ok(Gpu { device, context, video, manager, name, lost: AtomicBool::new(false), gate: Mutex::new(()) })
+        let (name, luid) = adapter_identity(&device);
+        let name = name.unwrap_or_else(|| "an unknown adapter".into());
+        Ok(Gpu { device, context, video, manager, name, luid, lost: AtomicBool::new(false), gate: Mutex::new(()) })
     }
 
     fn usable(&self) -> bool {
         // SAFETY: a plain COM call on a live interface.
         !self.lost.load(Ordering::Relaxed) && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
+    }
+
+    pub(super) fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    #[cfg(test)]
+    pub(super) fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
+    pub(super) fn luid(&self) -> Option<(u32, i32)> {
+        self.luid
     }
 
     /// The adapter's description (for logs).
@@ -149,6 +166,35 @@ impl Gpu {
     /// that message carries. Valid while this `Gpu` lives.
     pub fn manager_param(&self) -> usize {
         self.manager.as_raw() as usize
+    }
+
+    /// Block until every command given to the Direct3D 11 device so far has finished on the GPU
+    /// (an event query): what hands a surface written by Direct3D 11 over to another device. It
+    /// waits for the GPU only; no pixel is copied.
+    pub fn wait_for_gpu(&self) -> Result<(), String> {
+        let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        let desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 };
+        let mut query: Option<ID3D11Query> = None;
+        // SAFETY: a valid descriptor and out-pointer; the query and the context are used under the
+        // gate. `GetData` writes one BOOL (the size passed) into `done`.
+        unsafe {
+            self.device.CreateQuery(&desc, Some(&mut query)).map_err(|e| format!("cannot create a GPU query: {e}"))?;
+            let query = query.ok_or("no GPU query")?;
+            self.context.End(&query);
+            self.context.Flush();
+            let start = std::time::Instant::now();
+            loop {
+                let mut done = BOOL(0);
+                let hr = self.context.GetData(&query, Some((&mut done as *mut BOOL).cast()), std::mem::size_of::<BOOL>() as u32, 0);
+                if hr.is_ok() && done.as_bool() {
+                    return Ok(());
+                }
+                if hr.is_err() || start.elapsed() > std::time::Duration::from_secs(2) {
+                    return Err("the GPU did not finish in time".into());
+                }
+                std::thread::yield_now();
+            }
+        }
     }
 
     /// A failed call may mean the device is gone: if so, mark it so new decoders get a fresh one.
@@ -178,12 +224,12 @@ impl Gpu {
     }
 }
 
-fn adapter_name(device: &ID3D11Device) -> Option<String> {
-    let dxgi: IDXGIDevice = device.cast().ok()?;
+fn adapter_identity(device: &ID3D11Device) -> (Option<String>, Option<(u32, i32)>) {
+    let Ok(dxgi) = device.cast::<IDXGIDevice>() else { return (None, None) };
     // SAFETY: plain COM calls on live interfaces; the description is a plain struct filled by DXGI.
-    let desc = unsafe { dxgi.GetAdapter().ok()?.GetDesc().ok()? };
+    let Some(desc) = (unsafe { dxgi.GetAdapter().ok().and_then(|a| a.GetDesc().ok()) }) else { return (None, None) };
     let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-    Some(String::from_utf16_lossy(desc.Description.get(..len)?))
+    (desc.Description.get(..len).map(String::from_utf16_lossy), Some((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart)))
 }
 
 /// Reads decoded surfaces back into system memory through a staging texture it keeps between
