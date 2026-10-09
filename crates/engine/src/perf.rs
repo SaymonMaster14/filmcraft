@@ -33,6 +33,8 @@ pub fn decode_json() -> Value {
         "decodeMs": g.decode_ns as f64 / 1e6,
         "decodeMsPerSample": g.decode_ms_per_sample(),
         "framesDecoded": g.frames,
+        // sources opened whose video format has no decoder (shown as the unreadable slate)
+        "unsupportedVideo": filmcraft_codecs::hw::unsupported_video_count(),
         // Settings ▸ Playback ▸ Hardware decoding: pictures from OS hardware decoders vs ours,
         // hardware decoders created, streams handed to software up front, mid-stream fallbacks.
         "hardware": {

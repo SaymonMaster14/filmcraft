@@ -200,6 +200,28 @@ impl Decoder {
         self.draft
     }
 
+    /// Why streams configured by this `avcC` record cannot be decoded (10-bit, 4:2:2, 4:4:4,
+    /// interlaced, lossless: see [`Sps::unsupported_reason`]), read from its sequence parameter
+    /// sets without decoding anything. `None` when it is decodable or the record is unreadable
+    /// (the decoder reports that itself).
+    pub fn avcc_unsupported(avcc: &[u8]) -> Option<String> {
+        let count = (*avcc.get(5)? & 0x1f) as usize;
+        let mut pos = 6usize;
+        for _ in 0..count {
+            let len = u16::from_be_bytes([*avcc.get(pos)?, *avcc.get(pos + 1)?]) as usize;
+            pos = pos.checked_add(2)?;
+            let nal = avcc.get(pos..pos.checked_add(len)?)?;
+            pos += len;
+            if nal.first().is_some_and(|h| h & 0x1f == nal_type::SPS)
+                && let Ok(sps) = Sps::parse(&unescape_rbsp(&nal[1..]))
+                && let Some(why) = sps.unsupported_reason()
+            {
+                return Some(why);
+            }
+        }
+        None
+    }
+
     /// Configure from an `avcC` (AVCDecoderConfigurationRecord) box payload.
     pub fn from_avcc(avcc: &[u8]) -> Result<Self> {
         let mut d = Decoder::new();

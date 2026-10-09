@@ -132,6 +132,13 @@ pub trait MediaSource: Send + Sync {
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>>;
     /// `frames` audio frames starting at sample index `start` (at `sample_rate`, media time).
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer>;
+    /// Why the video stream cannot be decoded (a codec profile or format FilmCraft has no decoder
+    /// for: "H.264 High 10 (4:2:0, 10-bit) is not supported yet"), when the file opens but its
+    /// pictures never will. The media pool then shows the unreadable slate for the video (audio
+    /// still plays) instead of letting each frame request fail unseen.
+    fn unsupported_video(&self) -> Option<String> {
+        None
+    }
 }
 
 pub type SharedSource = Arc<dyn MediaSource>;

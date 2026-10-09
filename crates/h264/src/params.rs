@@ -515,6 +515,41 @@ impl Sps {
         self.max_dpb_frames()
     }
 
+    /// Why this decoder cannot decode streams with this SPS, in words for the user ("H.264 High 10
+    /// (4:2:0, 10-bit) is not supported yet"), or `None` when it can. [`Sps::check_supported`] is
+    /// the same test as a decoder error.
+    pub fn unsupported_reason(&self) -> Option<String> {
+        let profile = match self.profile_idc {
+            66 => "Baseline",
+            77 => "Main",
+            88 => "Extended",
+            100 => "High",
+            110 => "High 10",
+            122 => "High 4:2:2",
+            244 => "High 4:4:4 Predictive",
+            44 => "CAVLC 4:4:4 Intra",
+            _ => "",
+        };
+        let name = if profile.is_empty() { format!("profile {}", self.profile_idc) } else { profile.to_string() };
+        let chroma = match self.chroma_array_type() {
+            0 => "4:0:0",
+            1 => "4:2:0",
+            2 => "4:2:2",
+            _ => "4:4:4",
+        };
+        let depth = self.bit_depth_luma.max(self.bit_depth_chroma);
+        if self.chroma_array_type() != 1 || self.bit_depth_luma != 8 || self.bit_depth_chroma != 8 {
+            return Some(format!("H.264 {name} ({chroma}, {depth}-bit) is not supported yet"));
+        }
+        if !self.frame_mbs_only {
+            return Some(format!("H.264 {name} interlaced (field / MBAFF) coding is not supported yet"));
+        }
+        if self.qpprime_y_zero_transform_bypass {
+            return Some(format!("H.264 {name} lossless (transform bypass) coding is not supported yet"));
+        }
+        None
+    }
+
     pub fn check_supported(&self) -> Result<()> {
         if !self.frame_mbs_only {
             return unsupported("interlaced (field / MBAFF) coding");

@@ -62,6 +62,7 @@ static FRAMES: AtomicU64 = AtomicU64::new(0);
 static SESSIONS: AtomicU64 = AtomicU64::new(0);
 static DECLINED: AtomicU64 = AtomicU64::new(0);
 static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static UNSUPPORTED_VIDEO: AtomicU64 = AtomicU64::new(0);
 
 /// The counters so far.
 pub fn hw_stats() -> HwStats {
@@ -81,6 +82,16 @@ pub fn note_hw_frames(n: usize) {
 /// A hardware decoder was created.
 pub fn note_hw_session() {
     SESSIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A source whose video format no decoder (ours included) supports was shown as the unreadable slate.
+pub fn note_unsupported_video() {
+    UNSUPPORTED_VIDEO.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Sources with undecodable video seen so far (`perf.stats` `unsupportedVideo`).
+pub fn unsupported_video_count() -> u64 {
+    UNSUPPORTED_VIDEO.load(Ordering::Relaxed)
 }
 
 /// A hardware factory declined a stream it is responsible for.

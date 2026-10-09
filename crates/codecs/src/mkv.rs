@@ -49,6 +49,9 @@ pub struct MkvSource {
     audio_starts: Vec<i64>,
     /// Decoder pre-roll after a seek, in source sample frames (0: prime with one packet).
     audio_preroll: i64,
+    /// Why the video track cannot be decoded (H.264 High 10, 4:2:2…): the file still opens, with its
+    /// audio, but every picture request fails with this reason.
+    unsupported_video: Option<String>,
 }
 
 /// Sample-exact Opus packet start positions (48 kHz frames, pre-skip removed).
@@ -336,6 +339,10 @@ impl MkvSource {
                 }
             })
             .unwrap_or(0);
+        let unsupported_video = match ventry.as_ref().map(|e| &e.codec) {
+            Some(CodecConfig::Avc(a)) => filmcraft_h264::Decoder::avcc_unsupported(&a.to_bytes()),
+            _ => None,
+        };
         Ok(Self {
             info,
             bytes,
@@ -347,6 +354,7 @@ impl MkvSource {
             audio: Mutex::new(AudioState { decoder: None, packets: HashMap::new(), order: Vec::new(), last_decoded: None }),
             audio_starts,
             audio_preroll,
+            unsupported_video,
         })
     }
 
@@ -452,6 +460,9 @@ impl VideoSamples for MkvVideo<'_> {
         self.src.read(self.track, i)
     }
     fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
+        if let Some(why) = &self.src.unsupported_video {
+            return Err(CodecError::Unsupported(why.clone()));
+        }
         match &self.src.ventry {
             Some(e) => make_video_decoder(e),
             None => Err(CodecError::Unsupported(format!("no decoder for {} video", codec_label(&self.src.file.tracks[self.track].codec)))),
@@ -464,7 +475,14 @@ impl MediaSource for MkvSource {
         &self.info
     }
 
+    fn unsupported_video(&self) -> Option<String> {
+        self.unsupported_video.clone()
+    }
+
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
+        if let Some(why) = &self.unsupported_video {
+            return Err(MediaError::Unsupported(why.clone()));
+        }
         let ti = self.vtrack.ok_or(MediaError::NoStream("video"))?;
         let t = req.time.max(Tick::ZERO);
         let target = from_tick(&self.file.tracks[ti], t);

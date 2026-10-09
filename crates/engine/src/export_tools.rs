@@ -369,12 +369,39 @@ fn write_sidecar(s: &Session, project: &Project, seq: ItemId, settings: &ExportS
     Ok(Some(path))
 }
 
+/// An export must not bake the unreadable slate into the output for a clip whose video format has
+/// no decoder (H.264 High 10 / 4:2:2…): refuse with the reason, naming the file.
+fn refuse_unsupported_video(s: &Session, project: &Arc<Project>, seq: ItemId) -> Result<()> {
+    fn visit(s: &Session, project: &Arc<Project>, seq: ItemId, depth: usize, seen: &mut std::collections::HashSet<ItemId>) -> Result<()> {
+        let Some(q) = project.sequence(seq).filter(|_| depth < 8) else { return Ok(()) };
+        for t in q.video_tracks.iter().filter(|t| t.enabled) {
+            for it in t.items.iter().filter(|i| i.enabled) {
+                if !seen.insert(it.item) {
+                    continue;
+                }
+                if project.sequence(it.item).is_some() {
+                    visit(s, project, it.item, depth + 1, seen)?;
+                } else if project.item(it.item).and_then(|p| p.as_media()).is_some() {
+                    // resolving records why the pool shows a slate for it
+                    let _ = s.media.full_res_source(project, it.item, &*s.services);
+                    if let Some(st) = s.media.offline_status(it.item).filter(|st| st.unsupported_video) {
+                        return Err(EngineError::Other(format!("{}: {}", file_name(&st.path), st.error)));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    visit(s, project, seq, 0, &mut Default::default())
+}
+
 /// Run an export of `seq` in `project` as a background job (or now, with `wait`); returns the job id.
 pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut settings: ExportSettings, label: String, wait: bool) -> Result<u64> {
     let format = settings.format;
     if !filmcraft_export::available(format) {
         return Err(EngineError::Other(format!("{} export is not available (no encoder registered)", format.label())));
     }
+    refuse_unsupported_video(s, &project, seq)?;
     if s.services.export_in_memory() {
         let services = s.services.clone();
         settings.sink = Some(filmcraft_export::OutputSink(Arc::new(move |path: &str, data: Vec<u8>| services.write_file(path, &data))));

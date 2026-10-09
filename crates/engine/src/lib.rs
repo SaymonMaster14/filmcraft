@@ -1102,6 +1102,8 @@ mod transcript_tests;
 #[cfg(test)]
 mod trim_tests;
 #[cfg(test)]
+mod unsupported_video_tests;
+#[cfg(test)]
 mod vfx_tests;
 #[cfg(test)]
 mod voiceover_tests;

@@ -886,6 +886,15 @@ fn build() -> Vec<CommandSpec> {
                     }
                 }
             }
+            // a video format with no decoder (H.264 High 10, 4:2:2…) imports, but shows the unreadable
+            // slate: say so now instead of leaving it to the first render
+            for item in &item_ids {
+                let _ = s.media.full_res_source(&s.project, *item, &*s.services);
+                if let Some(st) = s.media.offline_status(*item).filter(|st| st.unsupported_video) {
+                    let name = std::path::Path::new(&st.path).file_name().map_or(st.path.clone(), |n| n.to_string_lossy().to_string());
+                    errors.push(format!("{name}: {}", st.error));
+                }
+            }
             let ingest = match crate::proxies::ingest(s, &item_ids) {
                 Ok(v) => v,
                 Err(e) => {

@@ -28,6 +28,9 @@ pub struct OfflineStatus {
     pub reason: OfflineReason,
     pub path: String,
     pub error: String,
+    /// The file opens and its audio plays, but its video format has no decoder (the slate stands in
+    /// for the pictures; an export would bake the slate into the output, so it refuses instead).
+    pub unsupported_video: bool,
 }
 
 pub struct MediaPool {
@@ -139,8 +142,24 @@ impl MediaPool {
 
     /// Cache a source opened from `path` for an item.
     pub fn insert_file(&self, item: ItemId, path: &str, src: SharedSource) {
+        let src = self.checked(item, path, src);
+        let playable = src.unsupported_video().is_none();
         self.sources.write().unwrap_or_else(|e| e.into_inner()).insert(item, (format!("file:{path}"), src));
-        self.offline.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
+        if playable {
+            self.offline.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
+        }
+    }
+
+    /// A freshly opened file source: when its video format has no decoder (H.264 High 10 / 4:2:2…)
+    /// the item shows the unreadable slate for its pictures (its audio still plays) and records
+    /// why, instead of every frame request failing unseen and rendering black.
+    fn checked(&self, item: ItemId, path: &str, s: SharedSource) -> SharedSource {
+        let Some(why) = s.unsupported_video() else { return s };
+        log::warn!("media video unsupported: {path}: {why}");
+        filmcraft_codecs::hw::note_unsupported_video();
+        self.set_offline_with(item, OfflineReason::Unreadable, path, &why, true);
+        let slate = SlateSource::new(s.info().clone(), &file_name(path), OfflineReason::Unreadable);
+        Arc::new(UnsupportedVideoSource { inner: s, slate })
     }
 
     pub fn remove(&self, item: ItemId) {
@@ -248,7 +267,10 @@ impl MediaPool {
                 self.open_file(path, services)
             } {
                 Ok(s) => {
-                    self.offline.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
+                    let s = self.checked(item, path, s);
+                    if s.unsupported_video().is_none() {
+                        self.offline.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
+                    }
                     s
                 }
                 Err(_) if filmcraft_media::pending::is_set() => {
@@ -268,7 +290,14 @@ impl MediaPool {
     }
 
     fn set_offline(&self, item: ItemId, reason: OfflineReason, path: &str, error: &str) {
-        self.offline.write().unwrap_or_else(|e| e.into_inner()).insert(item, OfflineStatus { reason, path: path.to_string(), error: error.to_string() });
+        self.set_offline_with(item, reason, path, error, false);
+    }
+
+    fn set_offline_with(&self, item: ItemId, reason: OfflineReason, path: &str, error: &str, unsupported_video: bool) {
+        self.offline
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(item, OfflineStatus { reason, path: path.to_string(), error: error.to_string(), unsupported_video });
     }
 
     fn proxy_source(&self, item: ItemId, path: &str, m: &MediaClip, services: &dyn Services) -> Option<SharedSource> {
@@ -358,6 +387,28 @@ impl MediaSource for SlateSource {
     }
     fn audio(&self, _start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
         Ok(AudioBuffer::silence(sample_rate, self.info.audio.as_ref().map_or(2, |a| a.channels as usize), frames))
+    }
+}
+
+/// A file whose video format has no decoder: its pictures are the unreadable slate, its audio
+/// is the file's own.
+pub struct UnsupportedVideoSource {
+    inner: SharedSource,
+    slate: SlateSource,
+}
+
+impl MediaSource for UnsupportedVideoSource {
+    fn info(&self) -> &MediaInfo {
+        self.inner.info()
+    }
+    fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+        self.slate.video_frame(req)
+    }
+    fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<AudioBuffer> {
+        self.inner.audio(start, frames, sample_rate)
+    }
+    fn unsupported_video(&self) -> Option<String> {
+        self.inner.unsupported_video()
     }
 }
 

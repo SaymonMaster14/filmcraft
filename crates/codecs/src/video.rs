@@ -205,7 +205,10 @@ pub struct H264Decoder {
 impl H264Decoder {
     pub fn new(avcc: Vec<u8>) -> Result<Self> {
         recycle_h264_planes();
-        let dec = filmcraft_h264::Decoder::from_avcc(&avcc).map_err(|e| CodecError::Decode(e.to_string()))?;
+        if let Some(why) = filmcraft_h264::Decoder::avcc_unsupported(&avcc) {
+            return Err(CodecError::Unsupported(why));
+        }
+        let dec = filmcraft_h264::Decoder::from_avcc(&avcc).map_err(h264_error)?;
         let length_size = avcc_length_size(&avcc);
         Ok(Self { avcc, dec, length_size, draft: false })
     }
@@ -238,7 +241,7 @@ impl H264Decoder {
 
 impl VideoDecoder for H264Decoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
-        let pics = self.dec.decode(sample, pts).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let pics = self.dec.decode(sample, pts).map_err(h264_error)?;
         Ok(pics.into_iter().map(Self::convert).collect())
     }
     fn flush(&mut self) -> Vec<DecodedFrame> {
@@ -268,6 +271,15 @@ impl VideoDecoder for H264Decoder {
     fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
         // Annex B samples carry their parameter sets: an IDR access unit is a starting point.
         (self.length_size == 0).then(|| filmcraft_bitstream::annexb_nals(sample).iter().any(|n| n.first().is_some_and(|h| h & 0x1f == 5)))
+    }
+}
+
+/// A decoder error as a codec error: "not implemented" stays `Unsupported` (the pool shows the
+/// unreadable slate for it) rather than becoming a generic decode failure.
+fn h264_error(e: filmcraft_h264::Error) -> CodecError {
+    match e {
+        filmcraft_h264::Error::Unsupported(s) => CodecError::Unsupported(format!("H.264: {s}")),
+        other => CodecError::Decode(other.to_string()),
     }
 }
 

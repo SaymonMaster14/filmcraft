@@ -53,3 +53,31 @@ fn bframe_mp4_duration_is_the_decoded_frame_count() {
     let src = filmcraft_codecs::open_bytes("bframes_x264.mp4", bytes(&f)).unwrap();
     assert_eq!(src.info().duration, filmcraft_time::FrameRate::FPS_30.tick_of(n as i64));
 }
+
+/// H.264 High 10 and High 4:2:2 have no decoder yet: the file opens (audio plays), says why its
+/// video is unsupported, and a picture request is an `Unsupported` error naming the reason; the
+/// 8-bit 4:2:0 High control decodes.
+#[test]
+fn h264_high10_and_high422_report_unsupported_video() {
+    use filmcraft_media::{FrameRequest, MediaError};
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    for (name, pix_fmt, profile, why) in [
+        ("h264_high10.mp4", "yuv420p10le", "high10", "H.264 High 10 (4:2:0, 10-bit) is not supported yet"),
+        ("h264_high422.mp4", "yuv422p", "high422", "H.264 High 4:2:2 (4:2:2, 8-bit) is not supported yet"),
+        ("h264_high8.mp4", "yuv420p", "high", ""),
+    ] {
+        let args = ["-f", "lavfi", "-i", "testsrc2=size=160x96:rate=24:duration=1", "-c:v", "libx264", "-pix_fmt", pix_fmt, "-profile:v", profile];
+        let Some(f) = fixture(&ff, name, &args) else {
+            eprintln!("SKIPPED: ffmpeg cannot write {name}");
+            continue;
+        };
+        let src = filmcraft_codecs::open_bytes(name, bytes(&f)).unwrap();
+        let r = src.video_frame(FrameRequest { time: filmcraft_time::Tick::ZERO, scale: 1.0 });
+        if why.is_empty() {
+            assert!(src.unsupported_video().is_none() && r.is_ok(), "{name}: {:?}", r.err());
+        } else {
+            assert_eq!(src.unsupported_video().as_deref(), Some(why), "{name}");
+            assert!(matches!(&r, Err(MediaError::Unsupported(w)) if w == why), "{name}: {:?}", r.err());
+        }
+    }
+}

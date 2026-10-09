@@ -43,6 +43,9 @@ pub struct Mp4Source {
     audio_offset: i64,
     /// Decoder pre-roll after a seek, in audio track timescale units (0: prime with one packet).
     audio_preroll: i64,
+    /// Why the video track cannot be decoded (H.264 High 10, 4:2:2…): the file still opens, with its
+    /// audio, but every picture request fails with this reason.
+    unsupported_video: Option<String>,
 }
 
 pub fn sniff(b: &[u8]) -> bool {
@@ -267,6 +270,10 @@ impl Mp4Source {
                 }
             })
             .unwrap_or((0, 0));
+        let unsupported_video = vtrack.and_then(|i| match file.tracks[i].entries.first().map(|e| &e.codec) {
+            Some(CodecConfig::Avc(a)) => filmcraft_h264::Decoder::avcc_unsupported(&a.to_bytes()),
+            _ => None,
+        });
         Ok(Self {
             info,
             bytes,
@@ -278,6 +285,7 @@ impl Mp4Source {
             audio_starts,
             audio_offset,
             audio_preroll,
+            unsupported_video,
         })
     }
 
@@ -366,6 +374,9 @@ impl VideoSamples for Mp4Video<'_> {
         self.src.read(self.track, i)
     }
     fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
+        if let Some(why) = &self.src.unsupported_video {
+            return Err(CodecError::Unsupported(why.clone()));
+        }
         make_video_decoder(&self.src.file.tracks[self.track].entries[0])
     }
 }
@@ -375,7 +386,14 @@ impl MediaSource for Mp4Source {
         &self.info
     }
 
+    fn unsupported_video(&self) -> Option<String> {
+        self.unsupported_video.clone()
+    }
+
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>, MediaError> {
+        if let Some(why) = &self.unsupported_video {
+            return Err(MediaError::Unsupported(why.clone()));
+        }
         let f = self.video_at(req.time.max(Tick::ZERO))?;
         Ok(f)
     }
